@@ -16,3 +16,8 @@ datasets/
 .vscode/
 .idea/
 .DS_Store
+
+# 忽略可视化输出结果
+vis_results_all/
+vis_results_breakfast_box/
+
