@@ -4,6 +4,8 @@ __pycache__/
 *.pt
 *.pth
 *.pkl
+*.png
+*.jpg
 
 # === 常见的输出与数据集目录 (防止误提交) ===
 mvtec_loco_ad_models/
