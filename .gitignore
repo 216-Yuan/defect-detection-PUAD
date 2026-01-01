@@ -1,2 +1,18 @@
 __pycache__/
 *.pyc
+# === 核心模型文件 (绝对不能提交) ===
+*.pt
+*.pth
+*.pkl
+
+# === 常见的输出与数据集目录 (防止误提交) ===
+mvtec_loco_ad_models/
+checkpoints/
+output/
+results/
+datasets/
+
+# === VS Code 与系统生成文件 ===
+.vscode/
+.idea/
+.DS_Store
