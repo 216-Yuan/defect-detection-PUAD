@@ -2,7 +2,7 @@ import os
 from typing import Tuple, Union
 
 from puad.common import build_imagenet_normalization
-from puad.dataset import NormalDataset, RandomAugment, split_dataset
+from puad.dataset import NormalDataset, RandomAugment, split_dataset, StructuralAnomalyAugment
 from puad.efficientad.inference import EfficientADInference, QuantileDict
 from puad.efficientad.pretrained_feature_extractor import PretrainedFeatureExtractor
 from puad.networks import AutoEncoder, PDN_M, PDN_S
@@ -13,7 +13,10 @@ from torch.optim import Adam
 from torch.utils.data import DataLoader
 import torchvision
 from torchvision import transforms
+from torchvision.utils import save_image
 from tqdm import tqdm
+import numpy as np
+from PIL import Image
 
 
 def train_student_and_autoencoder(
@@ -32,6 +35,57 @@ def train_student_and_autoencoder(
     This implementation followed `Algorithm 1` in the original EfficentAD paper:
     https://arxiv.org/abs/2303.14535
     """
+    # =====================================================================
+    # 实例化合成异常增强器
+    # =====================================================================
+    augmentor = StructuralAnomalyAugment(img_size=img_size)
+    
+    # ImageNet 归一化参数（用于反归一化）
+    MEAN = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(device)
+    STD = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(device)
+    
+    def generate_synthetic_batch(normal_tensor_batch, augmentor):
+        """
+        Tensor → PIL → Augment → Tensor 桥接函数
+        
+        流程:
+        1. 反归一化 (Denormalize): tensor * std + mean
+        2. 转换为 Numpy/PIL
+        3. 应用 Augmentor (CPU)
+        4. 重新归一化 (Normalize)
+        
+        Args:
+            normal_tensor_batch: (B, C, H, W) 归一化后的 Tensor
+            augmentor: StructuralAnomalyAugment 实例
+        
+        Returns:
+            (B, C, H, W) 归一化后的合成异常 Tensor
+        """
+        # Step 1: 反归一化
+        denormed = normal_tensor_batch * STD + MEAN
+        
+        # Step 2: Clip to [0,1] & Convert to [0,255] uint8
+        denormed = torch.clamp(denormed, 0, 1) * 255.0
+        images_np = denormed.permute(0, 2, 3, 1).cpu().numpy().astype(np.uint8)  # (B, H, W, C)
+        
+        # Step 3: 逐张应用增强
+        augmented_list = []
+        for i in range(len(images_np)):
+            img_pil = Image.fromarray(images_np[i])
+            aug_pil = augmentor(img_pil)  # 调用 __call__
+            augmented_list.append(aug_pil)
+        
+        # Step 4: 重新转换为 Tensor 并归一化
+        recon_transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
+        
+        aug_tensors = [recon_transform(img).unsqueeze(0) for img in augmented_list]
+        return torch.cat(aug_tensors).to(normal_tensor_batch.device)
+    
+    # =====================================================================
+    
     if not (pdn_size == "s" or pdn_size == "m"):
         raise ValueError("pdn_size must be `s` or `m`.")
 
@@ -126,6 +180,19 @@ def train_student_and_autoencoder(
             img_train, img_aug = next(iter(train_dataloader))
             img_train = img_train.to(device)
             img_aug = img_aug.to(device)
+            
+            # =====================================================================
+            # 在线生成合成异常负样本
+            # =====================================================================
+            synthetic_anomaly = generate_synthetic_batch(img_train, augmentor)
+            
+            # 调试可视化：仅在第一次迭代保存
+            if it == 0:
+                debug_vis = synthetic_anomaly.clone().detach() * STD + MEAN
+                save_image(debug_vis, os.path.join(model_dir, 'debug_training_synthetic.png'))
+                print(f"\n🔍 [DEBUG] 合成异常样本已保存至: {os.path.join(model_dir, 'debug_training_synthetic.png')}")
+            # =====================================================================
+            
             with torch.no_grad():
                 teacher_output = teacher(img_train)
                 normalized_teacher_output = teacher_output_normalization(teacher_output)
@@ -134,9 +201,17 @@ def train_student_and_autoencoder(
             diff_teacher_student = (normalized_teacher_output - student_output_st) ** 2
             threshold = torch.quantile(input=diff_teacher_student, q=0.999)
             loss_hard = torch.mean(diff_teacher_student[torch.where(diff_teacher_student >= threshold)])
+            
+            # 原有 ImageNet 负样本惩罚
             imagenet_img, _ = next(iter(imagenet_dataloader))
             imagenet_img = imagenet_img.to(device)
-            loss_student = loss_hard + torch.mean(student(imagenet_img)[:, :out_channels, :, :] ** 2)
+            loss_imagenet = torch.mean(student(imagenet_img)[:, :out_channels, :, :] ** 2)
+            
+            # 新增：合成异常负样本惩罚
+            loss_synthetic = torch.mean(student(synthetic_anomaly)[:, :out_channels, :, :] ** 2)
+            
+            # 综合 Loss（等权重 1.0）
+            loss_student = loss_hard + loss_imagenet + loss_synthetic
             autoencoder_output = autoencoder(img_aug)
             with torch.no_grad():
                 teacher_output = teacher(img_aug)

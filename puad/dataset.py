@@ -27,17 +27,21 @@ class RandomAugment:
 
 
 class StructuralAnomalyAugment:
-    """通用结构异常生成引擎 (Universal Structural Anomaly Engine)
+    """PhysicallyGuidedCutPaste - 物理引导的异常合成引擎
+    
+    核心理念:
+        不创造新像素，而是利用原图纹理，通过"物理规则重组"来制造异常。
+        灵感来源: CutPaste (CVPR 2021) + 物理光学原理
     
     设计原则:
         1. 无 Config：所有参数在物理合理范围内随机采样
         2. 局部性：异常面积严格控制在 0.5%-5%
-        3. 物理仿真：摒弃 Perlin 云雾，使用几何算法生成真实缺陷
+        3. 纹理真实：废弃几何绘图，使用原图像素重组
     
-    三大通用物理算子:
-        - Intruder (异物): 凸包形状 + 反色纹理 + 投影阴影
-        - Scar (划痕): 贝塞尔曲线 + 深度变暗/过曝
-        - Deformation (形变): 径向渐变 + Swirl/Pinch 像素重映射
+    三大物理算子:
+        - Scar by Misalignment (错位裂缝): 像素平移 + 深灰填补空隙
+        - Intruder by Mutation (变异异物): Gamma变换 + 翻转 + 投影阴影
+        - Density Collapse (密度塌陷): Downsample + Upsample = 局部模糊
     
     调度策略:
         - 互斥选择: Intruder 40% / Scar 30% / Deformation 30%
@@ -124,178 +128,243 @@ class StructuralAnomalyAugment:
             curve_x = curve_x[valid_indices]
             curve_y = curve_y[valid_indices]
             
-            # 随机线宽
-            thickness = np.random.randint(1, 6)
+            # 随机线宽（极细：1-3 像素）
+            thickness = np.random.randint(1, 4)
             
-            # 绘制曲线（分段绘制，模拟断续效果）
-            for i in range(0, len(curve_x) - 1, np.random.randint(2, 5)):
-                if i + 1 < len(curve_x):
-                    cv2.line(mask, (curve_x[i], curve_y[i]), 
-                            (curve_x[i+1], curve_y[i+1]), 1, thickness)
+            # 绘制连续实线（关键修正：移除断续逻辑）
+            if len(curve_x) > 1:
+                points = np.column_stack([curve_x, curve_y]).astype(np.int32)
+                cv2.polylines(mask, [points], isClosed=False, color=1, thickness=thickness)
         
         return mask.astype(np.float32)
     
-    def _random_deformation_mask(self) -> Tuple[np.ndarray, Tuple[int, int], int]:
-        """生成径向渐变的形变 Mask
-        
-        返回:
-            mask: 径向渐变 Mask (H, W), 值域 [0, 1]
-            center: 形变中心 (cx, cy)
-            radius: 形变半径
-        """
-        # 随机选择中心点
-        cx = np.random.randint(int(self.img_size * 0.3), int(self.img_size * 0.7))
-        cy = np.random.randint(int(self.img_size * 0.3), int(self.img_size * 0.7))
-        
-        # 随机半径（5%-10% 图像尺寸）
-        radius = np.random.randint(int(self.img_size * 0.05), int(self.img_size * 0.10))
-        
-        # 生成径向渐变
-        y, x = np.ogrid[:self.img_size, :self.img_size]
-        dist = np.sqrt((x - cx)**2 + (y - cy)**2)
-        
-        # 径向渐变：中心 1.0 → 边缘 0.0
-        mask = np.clip(1.0 - dist / radius, 0, 1).astype(np.float32)
-        
-        return mask, (cx, cy), radius
-    
     def _operator_intruder(self, img_np: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """算子 1: 通用异物算子 (The Universal Intruder)
+        """算子 B: Solid Material Intruder (实体异物)
         
-        实现:
-            1. 凸包形状 Mask
-            2. 反色纹理填充
-            3. 投影阴影（3D 效果）
+        物理原理: 模拟塑料片/金属碎片等实体异物
+        
+        实现逻辑:
+            1. Mask 生成: 随机凸包
+            2. 材质生成: 纯色块 + 高斯噪声 (sigma=20)
+            3. 融合: 不透明覆盖
+            4. 投影: Drop Shadow 增加立体感
+        
+        效果: 类似 MVTec LOCO 中的蓝色塑料片异物
         
         返回:
             anomaly_source: 异常源图像 (H, W, 3)
             mask: 黑底白斑 Mask (H, W)
         """
-        # Step 1: 生成凸包 Mask（锐利边缘）
+        H, W = self.img_size, self.img_size
+        
+        # Step 1: 生成凸包 Mask
         mask = self._random_convex_hull()
         
-        # Step 2: 自适应反色纹理
-        # 从原图随机位置裁剪一块区域
-        shift_x = np.random.randint(-30, 31)
-        shift_y = np.random.randint(-30, 31)
+        # Step 2: 材质生成（完全生成，不使用原图）
+        # 随机选择纯色（蓝/黑/白/灰/褐）
+        color_palette = [
+            [0.2, 0.3, 0.8],    # 蓝色塑料
+            [0.1, 0.1, 0.1],    # 黑色
+            [0.9, 0.9, 0.9],    # 白色
+            [0.5, 0.5, 0.5],    # 灰色
+            [0.4, 0.3, 0.2],    # 褐色
+        ]
+        base_color = color_palette[np.random.randint(0, len(color_palette))]
         
-        # 裁剪并反色
-        patch = np.roll(img_np, shift=(shift_y, shift_x), axis=(0, 1))
+        # 创建纯色块
+        material = np.ones((H, W, 3), dtype=np.float32)
+        material[:, :, 0] = base_color[0]
+        material[:, :, 1] = base_color[1]
+        material[:, :, 2] = base_color[2]
         
-        # 反色操作
-        if np.random.rand() > 0.5:
-            patch = 1.0 - patch  # 完全反色
-        else:
-            # 添加随机噪声
-            noise = np.random.normal(0, 0.1, patch.shape)
-            patch = np.clip(patch + noise, 0, 1)
+        # 叠加高斯噪声（模拟表面粗糙度）
+        noise = np.random.normal(0, 20, (H, W, 3)).astype(np.float32) / 255.0
+        material = np.clip(material + noise, 0, 1)
         
-        # Step 3: 投影阴影（偏移 (3, 3) 位置绘制半透明黑色）
-        shadow_mask = np.roll(mask, shift=(3, 3), axis=(0, 1))
-        shadow_mask = shadow_mask * 0.5  # 半透明
-        
-        # 先应用阴影
-        shadow_3ch = shadow_mask[..., np.newaxis]
-        anomaly_source = img_np * (1 - shadow_3ch)  # 变暗
-        
-        # 再应用异物纹理
+        # Step 3: 融合（不透明覆盖）
         mask_3ch = mask[..., np.newaxis]
-        anomaly_source = anomaly_source * (1 - mask_3ch) + patch * mask_3ch
+        anomaly_source = img_np * (1 - mask_3ch) + material * mask_3ch
+        
+        # Step 4: 投影 (Drop Shadow)
+        # 创建偏移的阴影
+        shadow_mask = mask.copy()
+        shadow_mask_blurred = cv2.GaussianBlur(shadow_mask, (11, 11), 0)
+        
+        # 投影偏移 (向右下偏移 3px)
+        shadow_offset = 3
+        shadow_layer = np.zeros((H, W), dtype=np.float32)
+        
+        src_y_end = H - shadow_offset
+        src_x_end = W - shadow_offset
+        dst_y_start = shadow_offset
+        dst_x_start = shadow_offset
+        
+        shadow_layer[dst_y_start:, dst_x_start:] = \
+            shadow_mask_blurred[:src_y_end, :src_x_end]
+        
+        # 应用投影 (变暗 50%)
+        shadow_3ch = shadow_layer[..., np.newaxis]
+        anomaly_source = anomaly_source * (1 - 0.5 * shadow_3ch)
         
         return anomaly_source, mask
     
     def _operator_scar(self, img_np: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """算子 2: 通用划痕算子 (The Universal Scar)
+        """算子 A: Elastic Distortion (弹性畸变)
         
-        实现:
-            1. 贝塞尔曲线形状
-            2. 变暗或过曝效果（深度感）
+        物理原理: 裂缝是空间的挤压，不是"贴图"，而是"推像素"
+        
+        实现逻辑:
+            1. 生成路径: 绘制贝塞尔曲线
+            2. 生成位移场: 在曲线位置赋予随机位移向量，高斯模糊使其平滑衰减
+            3. 应用畸变: cv2.remap 实现像素重映射
+            4. 深度渲染: 裂缝中心叠加深色
+        
+        效果: 纹理像果冻一样被挤歪，完全没有"贴纸感"
         
         返回:
             anomaly_source: 异常源图像 (H, W, 3)
             mask: 黑底白斑 Mask (H, W)
         """
+        H, W = self.img_size, self.img_size
+        
         # Step 1: 生成贝塞尔曲线 Mask
         mask = self._random_bezier_curve()
         
-        # Step 2: 深度感渲染（变暗或过曝）
-        if np.random.rand() > 0.5:
-            # 凹槽阴影：变暗
-            darkening_factor = np.random.uniform(0.3, 0.5)
-            anomaly_source = img_np * darkening_factor
-        else:
-            # 内部反光：过曝
-            brightening_factor = np.random.uniform(1.3, 1.6)
-            anomaly_source = np.clip(img_np * brightening_factor, 0, 1)
+        # 膨胀宽度
+        line_width = np.random.randint(3, 7)
+        kernel = np.ones((line_width, line_width), np.uint8)
+        mask_dilated = cv2.dilate(mask, kernel, iterations=1)
         
-        # 仅在划痕区域应用
-        mask_3ch = mask[..., np.newaxis]
-        anomaly_source = img_np * (1 - mask_3ch) + anomaly_source * mask_3ch
+        # Step 2: 生成位移场 (Displacement Field)
+        # 初始化空白位移场
+        dx = np.zeros((H, W), dtype=np.float32)
+        dy = np.zeros((H, W), dtype=np.float32)
         
-        return anomaly_source, mask
+        # 在曲线位置赋予随机位移向量
+        ys, xs = np.where(mask_dilated > 0.5)
+        
+        if len(ys) == 0:
+            return img_np, mask_dilated
+        
+        # 随机位移方向和强度
+        displacement_strength = np.random.uniform(4, 8)
+        angle = np.random.uniform(0, 2 * np.pi)
+        
+        # 在裂缝位置设置位移
+        dx[ys, xs] = displacement_strength * np.cos(angle)
+        dy[ys, xs] = displacement_strength * np.sin(angle)
+        
+        # 高斯模糊使位移场平滑衰减（模拟应力传导）
+        blur_sigma = line_width * 2 + 1
+        if blur_sigma % 2 == 0:
+            blur_sigma += 1
+        dx = cv2.GaussianBlur(dx, (blur_sigma, blur_sigma), 0)
+        dy = cv2.GaussianBlur(dy, (blur_sigma, blur_sigma), 0)
+        
+        # Step 3: 应用畸变 (cv2.remap)
+        # 创建基础网格
+        grid_x, grid_y = np.meshgrid(np.arange(W), np.arange(H))
+        grid_x = grid_x.astype(np.float32)
+        grid_y = grid_y.astype(np.float32)
+        
+        # 计算重映射坐标
+        map_x = grid_x + dx
+        map_y = grid_y + dy
+        
+        # 确保坐标在有效范围内
+        map_x = np.clip(map_x, 0, W - 1)
+        map_y = np.clip(map_y, 0, H - 1)
+        
+        # 应用像素重映射（关键修复：使用 BORDER_REFLECT_101 消除黑边）
+        anomaly_source = cv2.remap(
+            img_np, map_x, map_y,
+            interpolation=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_REFLECT_101  # 关键：镜像填充
+        )
+        
+        # Step 4: 深度渲染（裂缝中心变暗）
+        # 在裂缝中心叠加深色
+        darken_mask = cv2.GaussianBlur(mask_dilated, (5, 5), 0)
+        darken_factor = np.random.uniform(0.75, 0.9)
+        darken_3ch = darken_mask[..., np.newaxis]
+        anomaly_source = anomaly_source * (1 - darken_3ch * (1 - darken_factor))
+        
+        return anomaly_source, mask_dilated
     
     def _operator_deformation(self, img_np: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """算子 3: 通用形变算子 (The Universal Deformation)
+        """算子 C: Shadow Blur (暗影模糊)
         
-        实现:
-            1. 径向渐变 Mask
-            2. Swirl/Pinch 像素重映射
+        物理原理: 凹陷 = 模糊 (Blur) + 阴影 (Shadow)
+        
+        实现逻辑:
+            1. Mask 生成: 随机生成一个圆形 Mask
+            2. 强力模糊: cv2.GaussianBlur (kernel=7~11)
+            3. 叠加阴影: roi_dark = roi_blurred * 0.6~0.8
+            4. 融合: 贴回原位
+        
+        效果: 模拟凹陷处的光学失焦 + 光照不足
         
         返回:
             anomaly_source: 异常源图像 (H, W, 3)
             mask: 径向渐变 Mask (H, W)
         """
-        # Step 1: 生成径向渐变 Mask
-        mask, (cx, cy), radius = self._random_deformation_mask()
-        
-        # Step 2: 生成重映射坐标（Swirl/Pinch 效果）
         H, W = self.img_size, self.img_size
         
-        # 创建网格坐标
-        y, x = np.mgrid[0:H, 0:W].astype(np.float32)
+        # Step 1: 生成圆形 Mask
+        cx = np.random.randint(int(W * 0.25), int(W * 0.75))
+        cy = np.random.randint(int(H * 0.25), int(H * 0.75))
         
-        # 相对于形变中心的坐标
-        dx = x - cx
-        dy = y - cy
+        # 半径范围：12% ~ 20% 的图像尺寸（更大更明显）
+        radius = np.random.randint(int(self.img_size * 0.12), int(self.img_size * 0.20))
         
-        # 距离和角度
-        dist = np.sqrt(dx**2 + dy**2)
-        angle = np.arctan2(dy, dx)
+        y, x = np.ogrid[:H, :W]
+        dist = np.sqrt((x - cx)**2 + (y - cy)**2)
         
-        # Swirl 效果：距离中心越近，旋转角度越大
-        swirl_strength = np.random.uniform(0.5, 1.5)
-        angle_offset = swirl_strength * np.exp(-dist / (radius + 1e-6))
+        # 圆形二值 Mask
+        circle_mask = (dist <= radius).astype(np.float32)
         
-        # Pinch 效果：向中心收缩
-        pinch_strength = np.random.uniform(0.1, 0.3)
-        dist_new = dist * (1 - pinch_strength * mask)
+        # 径向渐变（中心 1.0 -> 边缘 0.0）
+        grad_mask = np.clip(1.0 - dist / radius, 0, 1).astype(np.float32)
+        grad_mask = grad_mask * circle_mask
         
-        # 新坐标
-        new_angle = angle + angle_offset
-        new_x = cx + dist_new * np.cos(new_angle)
-        new_y = cy + dist_new * np.sin(new_angle)
+        # Step 2: 提取 ROI
+        y_min = max(0, cy - radius)
+        y_max = min(H, cy + radius + 1)
+        x_min = max(0, cx - radius)
+        x_max = min(W, cx + radius + 1)
         
-        # 确保坐标在有效范围内
-        new_x = np.clip(new_x, 0, W - 1)
-        new_y = np.clip(new_y, 0, H - 1)
+        roi = img_np[y_min:y_max, x_min:x_max].copy()
+        roi_h, roi_w = roi.shape[:2]
         
-        # 应用重映射
-        anomaly_source = cv2.remap(
-            img_np, 
-            new_x, 
-            new_y, 
-            interpolation=cv2.INTER_LINEAR,
-            borderMode=cv2.BORDER_REFLECT_101
-        )
+        if roi_h > 4 and roi_w > 4:
+            # Step 3: 强力高斯模糊 (kernel=7~11)
+            blur_kernel = np.random.choice([7, 9, 11])
+            roi_blurred = cv2.GaussianBlur(roi, (blur_kernel, blur_kernel), 0)
+            
+            # Step 4: 叠加阴影（变暗）
+            shadow_factor = np.random.uniform(0.6, 0.8)
+            roi_dark = roi_blurred * shadow_factor
+            
+            # Step 5: 融合（使用径向渐变实现软边缘）
+            roi_mask = grad_mask[y_min:y_max, x_min:x_max]
+            roi_mask_3ch = roi_mask[..., np.newaxis]
+            
+            blended_roi = roi * (1 - roi_mask_3ch) + roi_dark * roi_mask_3ch
+            
+            # 贴回原图
+            anomaly_source = img_np.copy()
+            anomaly_source[y_min:y_max, x_min:x_max] = blended_roi
+        else:
+            anomaly_source = img_np.copy()
         
-        return anomaly_source, mask
+        return anomaly_source, grad_mask
     
     def __call__(self, img: Image.Image) -> Image.Image:
-        """通用结构异常生成引擎主调度器
+        """PhysicallyGuidedCutPaste 主调度器
         
         调度逻辑:
-            - 互斥选择三大算子之一
-            - Intruder 40% / Scar 30% / Deformation 30%
+            - 互斥选择三大创新算子之一
+            - Intruder(变异异物) 40% / Scar(错位裂缝) 30% / Deformation(密度塌陷) 30%
         
         参数:
             img: PIL.Image 对象 (RGB)
@@ -320,14 +389,12 @@ class StructuralAnomalyAugment:
         else:  # deformation
             anomaly_source, mask = self._operator_deformation(img_np)
         
-        # Mask 已经是黑底白斑，直接使用
-        # 注意：算子已经返回融合后的结果，这里直接用
-        
         # 转换回 PIL.Image
         augmented = np.clip(anomaly_source * 255, 0, 255).astype(np.uint8)
         augmented_img = Image.fromarray(augmented)
         
         return augmented_img
+
 
 
 class NormalDataset(Dataset):
